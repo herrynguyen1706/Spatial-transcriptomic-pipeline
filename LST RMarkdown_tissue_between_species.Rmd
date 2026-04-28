@@ -1,0 +1,962 @@
+---
+---
+title: "Learning Spatial Transcriptomics: Human and NHP Comparison"
+author: "Template Creator"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: show
+    
+This vignette has been made to compare expression of one or more tissues between humans and NHPs. 
+---
+
+```{r configuration, include=FALSE}
+# ==============================================================================
+# 0. CORE DEPENDENCIES & USER CONFIGURATION
+# ==============================================================================
+
+#When prompted about package compiling, select "No"
+if (!requireNamespace("knitr", quietly = TRUE)) {
+  install.packages("knitr", repos = "http://cran.us.r-project.org")
+}
+if (!requireNamespace("rmarkdown", quietly = TRUE)) {
+  install.packages("rmarkdown", repos = "http://cran.us.r-project.org")
+}
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ------------------------------------------------------------------------------
+# GLOBAL DIRECTORIES & VARIABLES
+# ------------------------------------------------------------------------------
+# Automatically detect the user's home directory (e.g., C:\Users\rblair3)
+USER_HOME <- Sys.getenv("USERPROFILE") 
+if (USER_HOME == "") USER_HOME <- Sys.getenv("HOME") # Fallback for Mac/Linux
+
+# Define the master working directory where data is loaded AND outputs are saved.
+# This builds: C:\Users\[Username]\Box\LST\CosMX 6K NHP and Human TMA
+BASE_DIR <- file.path(USER_HOME, "Box", "LST", "CosMX 6K NHP and Human TMA")
+
+# Set global seed for reproducibility (e.g., UMAP generation, clustering)
+GLOBAL_SEED <- 42
+
+# Select datasets to load: c("NHP", "Human") or just c("Human")
+DATASET_TARGETS <- c("NHP", "Human") 
+
+# Define which column in your metadata contains the target variables (Case-insensitive)
+SUBSET_COLUMN <- "Tissue" 
+
+# Define target values (Leave as NULL to load all data)
+TARGET_VALUES <- c("Liver")
+```
+
+#Library setup
+```{r libraries, message=FALSE, warning=FALSE}
+# ==============================================================================
+# 1. ROBUST INSTALLER & LIBRARY SETUP
+# ==============================================================================
+set.seed(GLOBAL_SEED)
+print(paste("✅ Global Seed Set to:", GLOBAL_SEED))
+
+# The most robust way to handle dependencies in shared templates is 'pacman'.
+# It automatically checks if a package exists, installs it if missing, and loads it.
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman", repos = "http://cran.us.r-project.org")
+}
+
+# 1A. LOAD STANDARD CRAN PACKAGES
+pacman::p_load(
+  Matrix,
+  data.table,
+  Seurat,
+  ggplot2,
+  patchwork,
+  dplyr,
+  readxl,
+  remotes,
+  clustree,
+  ggrepel,
+  harmony,
+  R.utils
+)
+
+# 1B. LOAD CUSTOM GITHUB TOOLS (CosMx Scratch Space)
+install_cosmx_tools <- function() {
+  
+  tools <- list("scPearsonPCA" = "_code/scPearsonPCA")
+  missing_tools <- names(tools)[!sapply(names(tools), require, character.only = TRUE, quietly = TRUE)]
+  
+  if (length(missing_tools) == 0) {
+    print("✅ Custom CosMx tools are already installed.")
+    return(TRUE)
+  }
+  
+  print(paste("⚠️ Missing custom tools:", paste(missing_tools, collapse=", "), "- Starting installer..."))
+
+  # Force Fresh Download of the Nanostring Scratch Space Repository
+  zip_dest <- file.path(tempdir(), "CosMx_Repo.zip")
+  unzip_dest <- file.path(tempdir(), "CosMx_Unzipped")
+  
+  if (file.exists(zip_dest)) unlink(zip_dest, force = TRUE)
+  if (dir.exists(unzip_dest)) unlink(unzip_dest, recursive = TRUE, force = TRUE)
+  
+  print("⬇️ Downloading CosMx Repository...")
+  url <- "https://github.com/Nanostring-Biostats/CosMx-Analysis-Scratch-Space/archive/refs/heads/Main.zip"
+  
+  # FIX: Temporarily increase R's download timeout from 60 seconds to 1 hour
+  old_timeout <- getOption("timeout")
+  options(timeout = 3600)
+  
+  tryCatch({
+    download.file(url, destfile = zip_dest, mode = "wb", method = "auto")
+  }, error = function(e) {
+    stop("❌ Download failed. Check internet connection or firewall settings.")
+  })
+  
+  print("📦 Unzipping...")
+  unzip(zip_dest, exdir = unzip_dest)
+  
+  # Dynamic Path Finding for extracted repo
+  extracted_folders <- list.dirs(unzip_dest, full.names = TRUE, recursive = FALSE)
+  repo_root <- extracted_folders[1]
+  
+  # Install Missing Custom Tools
+  for (tool_name in missing_tools) {
+    sub_dir <- tools[[tool_name]]
+    pkg_path <- file.path(repo_root, sub_dir)
+    
+    # Fix DESCRIPTION file typos if present in the raw repo
+    desc_file <- file.path(pkg_path, "DESCRIPTION")
+    if (file.exists(desc_file)) {
+      desc_lines <- readLines(desc_file)
+      desc_lines <- gsub("Matrix,", "Matrix", desc_lines)
+      writeLines(desc_lines, desc_file)
+    }
+
+    print(paste("🚀 Compiling", tool_name, "..."))
+    remotes::install_local(pkg_path, dependencies = FALSE, force = TRUE, quiet = FALSE)
+    library(tool_name, character.only = TRUE)
+  }
+  print("🎉 All tools installed and loaded successfully!")
+}
+
+# Run the installer check
+install_cosmx_tools()
+```
+
+
+#Data Loading
+```{r}
+# ==============================================================================
+# 2. MULTI-DATASET LOADING & INTEGRATION
+# ==============================================================================
+
+processed_matrices <- list()
+processed_metadata <- list()
+
+for (species in DATASET_TARGETS) {
+  print(paste("=================================================="))
+  print(paste("🔄 PROCESSING DATASET:", species))
+  print(paste("=================================================="))
+  
+  # --- A. DYNAMIC PATH ROUTING ---
+  if (species == "NHP") {
+    data_dir <- file.path(BASE_DIR, "flatFiles", "S42NHPArray150")
+    meta_path <- file.path(data_dir, "NHP CosMX TMA metadata.csv")
+  } else if (species == "Human") {
+    data_dir <- file.path(BASE_DIR, "flatFiles", "HumanTMA")
+    meta_path <- file.path(data_dir, "Human CosMX TMA metadata.csv")
+  }
+  
+  # Find the flat files using regex so exact file naming variations don't break the script
+  expr_file <- list.files(data_dir, pattern = ".*_exprMat_file.csv.gz", full.names = TRUE)[1]
+  base_meta_file <- list.files(data_dir, pattern = ".*_metadata_file.csv.gz", full.names = TRUE)[1]
+  
+  if (is.na(base_meta_file)) stop(paste("❌ Base metadata not found for", species, "in", data_dir))
+  
+  # --- B. METADATA PARSING & PREFIXING ---
+  metadata <- fread(base_meta_file)
+  
+  # Merge custom FOV metadata if it exists
+  if (file.exists(meta_path)) {
+    fov_metadata <- fread(meta_path)
+    if ("FOV" %in% colnames(fov_metadata)) setnames(fov_metadata, "FOV", "fov")
+    metadata$fov <- as.integer(metadata$fov)
+    metadata <- merge(metadata, fov_metadata, by = "fov", all.x = TRUE)
+  }
+  
+  # Append species prefix to prevent cell_ID collisions between the arrays
+  metadata$Species <- species
+  metadata$cell_id_unique <- paste0(species, "_", metadata$fov, "_", metadata$cell_ID)
+  rownames(metadata) <- metadata$cell_id_unique
+  
+  # --- C. DYNAMIC SUBSETTING (CASE-INSENSITIVE) ---
+  metadata_subset <- metadata
+  
+  if (!is.null(TARGET_VALUES)) {
+    target_col_lower <- tolower(SUBSET_COLUMN)
+    cols_lower <- tolower(colnames(metadata))
+    
+    if (!(target_col_lower %in% cols_lower)) {
+      print(paste("❌ ERROR: Column matching '", SUBSET_COLUMN, "' not found in", species, "metadata!"))
+      print(paste("Available columns are:", paste(colnames(metadata), collapse=", ")))
+      stop("Please update SUBSET_COLUMN in the User Configuration.")
+    }
+    
+    actual_col_name <- colnames(metadata)[match(target_col_lower, cols_lower)]
+    target_column_data <- metadata[[actual_col_name]]
+    
+    keep_rows <- grepl(paste(TARGET_VALUES, collapse="|"), target_column_data, ignore.case = TRUE)
+    metadata_subset <- metadata[keep_rows, ]
+    
+    if (nrow(metadata_subset) == 0) {
+      print(paste("⚠️ WARNING: No cells found for", species, "using targets:", paste(TARGET_VALUES, collapse=", ")))
+      next 
+    }
+  }
+  print(paste("✅ Retained", nrow(metadata_subset), "cells for", species))
+  
+  # --- D. MEMORY-OPTIMIZED MATRIX LOADING ---
+  # Only load the count data for the cells that survived the subsetting
+  counts_wide <- fread(expr_file)
+  
+  valid_fovs <- unique(metadata_subset$fov)
+  counts_wide <- counts_wide[fov %in% valid_fovs]
+  
+  counts_wide[, cell_id_unique := paste0(species, "_", fov, "_", cell_ID)]
+  counts_wide <- counts_wide[cell_id_unique %in% metadata_subset$cell_id_unique]
+  
+  meta_cols <- c("fov", "cell_ID", "cell_id_unique")
+  gene_cols <- setdiff(colnames(counts_wide), meta_cols)
+  
+  mat_data <- as.matrix(counts_wide[, ..gene_cols])
+  rownames(mat_data) <- counts_wide$cell_id_unique
+  
+  # Convert to a sparse matrix to save memory before merging
+  mat <- Matrix::t(as(mat_data, "dgCMatrix"))
+  rm(counts_wide, mat_data); gc()
+  
+  processed_matrices[[species]] <- mat
+  processed_metadata[[species]] <- metadata_subset
+}
+
+# ==============================================================================
+# 3. MERGE DATASETS & CREATE SEURAT OBJECT
+# ==============================================================================
+print("==================================================")
+print("🧬 MERGING DATASETS AND INITIALIZING SEURAT")
+print("==================================================")
+
+if (length(processed_matrices) == 0) stop("❌ ERROR: No valid data loaded. Check your targets.")
+
+# Combine the sparse matrices and metadata tables
+final_mat <- do.call(cbind, processed_matrices)
+
+final_meta <- rbindlist(processed_metadata, fill = TRUE)
+final_meta <- as.data.frame(final_meta)
+rownames(final_meta) <- final_meta$cell_id_unique
+
+# Ensure metadata rows perfectly match the matrix columns
+final_meta <- final_meta[match(colnames(final_mat), final_meta$cell_id_unique), ]
+
+seurat_obj <- CreateSeuratObject(counts = final_mat, meta.data = final_meta, project = "Comparative_TMA")
+
+print("🎉 SUCCESS: Merged Seurat Object Created.")
+print(seurat_obj)
+print(table(seurat_obj$Species))
+```
+
+#Quality Control
+```{r}
+# ==============================================================================
+# QUALITY CONTROL & VISUALIZATION
+# ==============================================================================
+library(ggplot2)
+library(patchwork)
+
+print("Calculating QC Metrics...")
+
+# Calculate Negative Probe Ratio (Background noise)
+if ("nCount_negprobes" %in% colnames(seurat_obj@meta.data)) {
+  seurat_obj$propNegative <- seurat_obj$nCount_negprobes / (seurat_obj$nCount_RNA + seurat_obj$nCount_negprobes)
+} else {
+  print("⚠️ 'nCount_negprobes' not found. Setting propNegative to 0.")
+  seurat_obj$propNegative <- 0
+}
+
+# Generate QC Violin Plots grouped by Species
+qc_features <- c("nFeature_RNA", "nCount_RNA", "propNegative", "Area")
+
+# We group by Species to compare the arrays side-by-side
+print(VlnPlot(seurat_obj, features = qc_features, group.by = "Species", ncol = 4, pt.size = 0))
+
+# Feature Scatters to look for correlations
+p1 <- FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "Species")
+p2 <- FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "propNegative", group.by = "Species")
+print(p1 + p2)
+```
+
+#Metadata Download for LLM ingestion
+```{r}
+# ==============================================================================
+# SPECIAL QC DIAGNOSTICS & EXPORT
+# ==============================================================================
+library(dplyr)
+
+print("Generating Deep QC Plots...")
+
+p1 <- FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "propNegative", group.by = "Species") + 
+  geom_hline(yintercept = 0.10, color = "red", linetype = "dashed") + 
+  ggtitle("Negative Probes vs Counts")
+
+p2 <- FeatureScatter(seurat_obj, feature1 = "Area", feature2 = "nFeature_RNA", group.by = "Species") + 
+  geom_vline(xintercept = 20000, color = "red", linetype = "dashed") +
+  ggtitle("Cell Area vs Gene Complexity")
+
+# Spatial QC Check: Create a unique Species + FOV identifier to prevent cross-array merging
+seurat_obj$Species_FOV <- paste0(seurat_obj$Species, "_FOV", seurat_obj$fov)
+
+fov_qc <- seurat_obj@meta.data %>%
+  group_by(Species_FOV) %>%
+  summarize(
+    Mean_Negatives = mean(propNegative),
+    Mean_Counts = mean(nCount_RNA),
+    Species = first(Species)
+  )
+
+p3 <- ggplot(fov_qc, aes(x = Mean_Counts, y = Mean_Negatives, label = Species_FOV, color = Species)) +
+  geom_point() +
+  geom_text(size = 3, vjust = -0.5, show.legend = FALSE) +
+  ggtitle("Quality by FOV (Outlier Detection)") +
+  theme_bw()
+
+print((p1 + p2) / p3)
+
+# EXPORT METADATA (Dynamic Naming)
+meta_to_save <- seurat_obj@meta.data[, c("Species_FOV", "cell_ID", "nCount_RNA", "nFeature_RNA", "Area", "propNegative")]
+export_name <- paste0("Comparative_QC_Metadata_", Sys.Date(), ".csv")
+write.csv(meta_to_save, file = file.path(BASE_DIR, export_name))
+print(paste("✅ Metadata saved to:", file.path(BASE_DIR, export_name)))
+
+# ==============================================================================
+# ARTIFACT CHARACTERIZATION
+# ==============================================================================
+print("Analyzing False Positives in 'Artifact' Regions...")
+
+if ("artifact" %in% colnames(seurat_obj@meta.data)) {
+  seurat_obj$is_artifact <- seurat_obj$artifact == TRUE
+  n_artifact <- sum(seurat_obj$is_artifact, na.rm = TRUE)
+  
+  print(paste("Found", n_artifact, "cells in regions labeled 'Artifact'."))
+
+  if (n_artifact > 0) {
+    ap1 <- VlnPlot(seurat_obj, features = "nCount_RNA", group.by = "is_artifact", pt.size = 0, log = TRUE) + NoLegend()
+    ap2 <- VlnPlot(seurat_obj, features = "propNegative", group.by = "is_artifact", pt.size = 0) + NoLegend()
+    print(ap1 + ap2)
+    
+    ghost_cells <- seurat_obj@meta.data[seurat_obj$is_artifact == TRUE, ]
+    suggested_min_counts <- quantile(ghost_cells$nCount_RNA, 0.99)
+    
+    print("----------------------------------------------------------------")
+    print("👻 ARTIFACT CELL STATISTICS (Background Noise Profile)")
+    print(paste("Max Counts (99th percentile):   ", round(suggested_min_counts, 0)))
+    print("----------------------------------------------------------------")
+  }
+} else {
+  print("⚠️ Column 'artifact' not found. Skipping artifact noise characterization.")
+}
+```
+
+#Filtering
+```{r}
+# ==============================================================================
+# BATCH-AWARE QUALITY CONTROL & FILTERING
+# ==============================================================================
+print("Starting Batch-Aware QC...")
+
+# USER CONFIG: Define which column represents your batches (e.g., "Species", "AnimalID", "Patient")
+BATCH_COL <- "Species" 
+
+if (!(BATCH_COL %in% colnames(seurat_obj@meta.data))) stop(paste("❌ BATCH_COL", BATCH_COL, "not found!"))
+
+# 1. VISUALIZE BATCH EFFECTS
+p1 <- VlnPlot(seurat_obj, features = "nCount_RNA", group.by = BATCH_COL, pt.size = 0, log = TRUE) + 
+  geom_hline(yintercept = 50, color = "red", linetype = "dashed")
+p2 <- VlnPlot(seurat_obj, features = "propNegative", group.by = BATCH_COL, pt.size = 0) + 
+  geom_hline(yintercept = 0.05, color = "red", linetype = "dashed")
+print(p1 + p2)
+
+# 2. CALCULATE BATCH STATISTICS
+batch_stats <- seurat_obj@meta.data %>%
+  group_by(!!sym(BATCH_COL)) %>%
+  summarize(
+    Median_Counts = median(nCount_RNA),
+    Median_Noise = median(propNegative),
+    Cell_Count = n()
+  )
+print("--- Batch Statistics ---")
+print(batch_stats)
+
+# 3. APPLY "FORGIVING" FILTERS
+MIN_COUNTS <- 50 
+MAX_NEGATIVE <- 0.10 
+MAX_AREA <- 20000
+
+print(paste("Applying Filters: Counts >", MIN_COUNTS, "| Neg <", MAX_NEGATIVE*100, "% | Area <", MAX_AREA))
+
+seurat_subset <- subset(seurat_obj, 
+                        subset = nFeature_RNA > 20 & 
+                                 nCount_RNA > MIN_COUNTS & 
+                                 propNegative < MAX_NEGATIVE & 
+                                 Area < MAX_AREA)
+
+cells_before <- ncol(seurat_obj)
+cells_after <- ncol(seurat_subset)
+print(paste("Original Cells:", cells_before, "| Remaining:", cells_after, "| Removed:", cells_before - cells_after))
+
+rm(seurat_obj); gc()
+```
+
+#Normalization and Dimensionality Reduction
+```{r}
+# ==============================================================================
+# NORMALIZATION & DIMENSIONALITY REDUCTION (scPearsonPCA)
+# ==============================================================================
+print("Running scPearsonPCA Normalization...")
+
+tc <- Matrix::colSums(seurat_subset[["RNA"]]$counts) 
+genefreq <- scPearsonPCA::gene_frequency(seurat_subset[["RNA"]]$counts) 
+
+seurat_subset <- FindVariableFeatures(seurat_subset, selection.method = "vst", nfeatures = 2000)
+hvgs <- VariableFeatures(seurat_subset)
+
+set.seed(42) 
+
+pcaobj <- sparse_quasipoisson_pca_seurat(
+  seurat_subset[["RNA"]]$counts[hvgs,],
+  totalcounts = tc, 
+  grate = genefreq[hvgs],
+  scale.max = 10, 
+  do.scale = TRUE, 
+  do.center = TRUE
+)
+
+seurat_subset[["pca"]] <- pcaobj$reduction.data
+print("✅ Normalization & PCA Complete.")
+
+print(ElbowPlot(seurat_subset, ndims = 50))
+gc()
+```
+
+#UMAP & Clustering
+```{r}
+# ==============================================================================
+# BATCH INTEGRATION (HARMONY) & CLUSTERING
+# ==============================================================================
+if (!require("harmony", quietly = TRUE)) install.packages("harmony")
+library(harmony)
+library(patchwork)
+
+print("Running Harmony Integration & Clustering...")
+
+# USER CONFIG: What metadata column defines your batches for integration?
+INTEGRATION_VAR <- "Species" 
+SEED_VALUE <- 42
+set.seed(SEED_VALUE)
+
+# 0. Generate Uncorrected UMAP (Before Harmony)
+# We save this to a custom reduction name so it doesn't get overwritten
+print("Generating uncorrected UMAP for baseline comparison...")
+seurat_subset <- RunUMAP(seurat_subset, reduction = "pca", dims = 1:20, 
+                         reduction.name = "umap_uncorrected", 
+                         reduction.key = "UMAPuncorrected_",
+                         seed.use = SEED_VALUE)
+
+# 1. Run Harmony (Integrate across Species arrays)
+print("Applying Harmony Batch Correction...")
+seurat_subset <- RunHarmony(object = seurat_subset, 
+                            group.by.vars = INTEGRATION_VAR, 
+                            reduction.use = "pca",        
+                            assay.use = "RNA", 
+                            project.dim = FALSE,
+                            plot_convergence = TRUE)
+
+# 2. Run Corrected UMAP & Find Neighbors
+print("Generating corrected UMAP and Clusters...")
+seurat_subset <- RunUMAP(seurat_subset, reduction = "harmony", dims = 1:20, 
+                         reduction.name = "umap", 
+                         reduction.key = "UMAP_",
+                         seed.use = SEED_VALUE)
+seurat_subset <- FindNeighbors(seurat_subset, reduction = "harmony", dims = 1:20)
+seurat_subset <- FindClusters(seurat_subset, resolution = 0.3, random.seed = SEED_VALUE)
+
+# 3. Visualization: Before vs After Batch Correction
+p_before <- DimPlot(seurat_subset, reduction = "umap_uncorrected", group.by = INTEGRATION_VAR) + 
+  ggtitle(paste("BEFORE Harmony:", INTEGRATION_VAR)) +
+  theme(legend.position = "bottom")
+
+p_after <- DimPlot(seurat_subset, reduction = "umap", group.by = INTEGRATION_VAR) + 
+  ggtitle(paste("AFTER Harmony:", INTEGRATION_VAR)) +
+  theme(legend.position = "bottom")
+
+print("Visualizing Batch Correction Effect:")
+print(p_before | p_after)
+
+# 4. Visualization: Biological Clusters & Subset Check
+p_clusters <- DimPlot(seurat_subset, reduction = "umap", label = TRUE) + 
+  ggtitle("Clusters (Cell Types)")
+
+# Dynamically find the exact case-sensitive column name to prevent 'undefined columns' errors
+actual_plot_col <- grep(paste0("^", SUBSET_COLUMN, "$"), colnames(seurat_subset@meta.data), ignore.case = TRUE, value = TRUE)
+
+p_subset <- DimPlot(seurat_subset, reduction = "umap", group.by = actual_plot_col) + 
+  ggtitle(paste("Subset Check:", actual_plot_col))
+
+print("Visualizing Downstream Biology:")
+print(p_clusters | p_subset)
+```
+
+
+#To Cluster or Not to Cluster
+```{r}
+#This block 1) Test multiple clustering resolutions 2) Checks for new clusters and the markers that define them 3) Checks cell size of new clusters (to make sure they aren't too small for downstream analysis) 4) Sets a winning resolution for future blocks
+
+#The purpose of this block is to determine the best resolution for clustering. The UMAPs in the block above this are at a resolution of 0.3, but you don't know if thats overclustering or underclustering (its just a starting point to see if you will get clusters). This block tests resolutions from (0.3-1, but you can change them). At each resolution level it generates a list of markers defining the cluster. This helps you decide if a new cluster is formed, is it a cluster that makes biological sense or is it a nonsensical split.
+
+#When complete you should check the .csv files this exports to analyze the markers definine the new clusters and to determine which cell types likely correspond to each of those clusters. !! In some instances this may not be appropriate because a diseased cell cluster may not express cannonical markers !!
+
+# ==============================================================================
+# MULTI-RESOLUTION SWEEP & MARKER DISCOVERY
+# ==============================================================================
+library(clustree)
+
+resolutions_to_test <- c(0.3, 0.5, 0.8, 1.0)
+print("🚀 Starting Multi-Resolution Sweep...")
+
+seurat_subset <- FindClusters(seurat_subset, resolution = resolutions_to_test, random.seed = 42, verbose = FALSE)
+print(clustree(seurat_subset, prefix = "RNA_snn_res.") + ggtitle("Cluster Stability Tree"))
+
+# USER CONFIG: Change this to the winning resolution based on the Clustree
+winner_res <- 0.5 
+final_markers <- NULL
+
+print("Applying Log-Normalization for Marker Search...")
+seurat_subset <- NormalizeData(seurat_subset, normalization.method = "LogNormalize", scale.factor = 10000)
+
+for (res in resolutions_to_test) {
+  Idents(seurat_subset) <- paste0("RNA_snn_res.", res)
+  print(paste("🔎 ANALYZING RESOLUTION:", res))
+  
+  markers <- FindAllMarkers(seurat_subset, only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.25, verbose = FALSE)
+  
+  # Save to dynamic file path
+  file_name <- paste0("MultiSpecies_Markers_Res_", res, ".csv")
+  write.csv(markers, file = file.path(BASE_DIR, file_name))
+  
+  if (res == winner_res) {
+    final_markers <- markers
+    print(paste("✅ Resolution", res, "selected as Final. Markers loaded into memory."))
+  }
+}
+
+Idents(seurat_subset) <- paste0("RNA_snn_res.", winner_res)
+
+top_markers <- final_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 20, order_by = avg_log2FC)
+
+write.csv(top_markers, file = file.path(BASE_DIR, "MultiSpecies_Top_Markers_Final.csv"))
+print("✅ Optimized Sweep Complete. Ready for Annotation.")
+```
+
+#Assign Cell Types/Names to each Cluster
+```{r}
+#Note this entire block is dependent on the results/interpretation of the prior block and the resolution you ultimately select. The MultiSpecies_Markers for the chosen resolution can be passed to the LLM to assist with initial cluster identifications/naming
+
+# ==============================================================================
+# STEP 8: HIERARCHICAL ANNOTATION
+# ==============================================================================
+print("Starting Cell Annotation...")
+
+# 1. SET THE GLOBAL BASELINE (Resolution 0.5)
+Idents(seurat_subset) <- "RNA_snn_res.0.5"
+
+# 2. RENAME THE CLUSTERS BASED ON BIOLOGY
+# The numeric IDs below match the markers found in the Res 0.5 CSV.
+base_cluster_ids <- c(
+  "0" = "Hepatocytes (CRHR2+)",      # Specialized/Altered subset
+  "1" = "Immune (Kupffer/Macs)",       # C1QB, HLA-DRA
+  "2" = "Hepatocytes (Canonical)",   # SERPINA1, TTR, FGG
+  "3" = "Endothelial (LSECs)",         # LDB2, KDR
+  "4" = "Fibroblasts / Portal Stroma", # DCN, CXCL12, Collagen
+  "5" = "Stellate / Smooth Muscle"     # ACTA2, TAGLN, MYH11
+)
+
+seurat_subset <- RenameIdents(seurat_subset, base_cluster_ids)
+
+# We save this final identity into the metadata for all downstream DEGs
+seurat_subset$CellType_Final <- Idents(seurat_subset)
+print("✅ High-Resolution Cell Types Assigned.")
+
+# ------------------------------------------------------------------------------
+# 3. VISUALIZATION
+# ------------------------------------------------------------------------------
+library(patchwork)
+
+# Generate the labeled UMAP (Explicitly forcing the Harmony-corrected map)
+p_final <- DimPlot(seurat_subset, 
+                   reduction = "umap",           # <-- THE FIX
+                   group.by = "CellType_Final", 
+                   label = TRUE, 
+                   repel = TRUE) + 
+  ggtitle("Final Annotated Cell Types (Res 0.5)") + 
+  theme(legend.position = "right")
+
+print(p_final)
+```
+
+#DEG
+```{r}
+#Changing the DE_GROUP_COL will switch these between Species or CellTypes. The Species comparison is primarily what we want to check (differences between NHPs and Humans). The CellType check, helps you better understand your clustering and decide if you need additional clustering or not
+
+# ==============================================================================
+# STEP 9: DIFFERENTIAL EXPRESSION & VOLCANO PLOTS
+# ==============================================================================
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+# ------------------------------------------------------------------------------
+# USER CONFIGURATION FOR DIFFERENTIAL EXPRESSION
+# ------------------------------------------------------------------------------
+# Define the metadata column to split your data by (e.g., "Species", "CellType_Final")
+DE_GROUP_COL <- "Species"
+
+# Define the two groups you want to compare within that column. 
+# Positive Log2FC will mean the gene is higher in GROUP_1.
+DE_GROUP_1 <- "Human"  
+DE_GROUP_2 <- "NHP"    
+
+print(paste("Running Differential Expression:", DE_GROUP_1, "vs", DE_GROUP_2))
+
+# ------------------------------------------------------------------------------
+# HELPER FUNCTION FOR VOLCANO PLOTS
+# ------------------------------------------------------------------------------
+plot_volcano <- function(de_results, title_text, group1_name, group2_name) {
+  de_results$diffexpressed <- "NO"
+  de_results$diffexpressed[de_results$avg_log2FC > 0.5 & de_results$p_val_adj < 0.05] <- paste("Higher in", group1_name)
+  de_results$diffexpressed[de_results$avg_log2FC < -0.5 & de_results$p_val_adj < 0.05] <- paste("Higher in", group2_name)
+  
+  de_results$delabel <- NA
+  top_genes <- head(de_results[order(de_results$p_val_adj), "Gene"], 15)
+  de_results$delabel[de_results$Gene %in% top_genes] <- de_results$Gene[de_results$Gene %in% top_genes]
+  
+  # Set dynamic colors
+  custom_colors <- c("grey", "red", "blue")
+  names(custom_colors) <- c("NO", paste("Higher in", group1_name), paste("Higher in", group2_name))
+  
+  p <- ggplot(data = de_results, aes(x = avg_log2FC, y = -log10(p_val_adj), col = diffexpressed, label = delabel)) +
+    geom_point(alpha = 0.7) + 
+    theme_minimal() +
+    geom_text_repel(max.overlaps = 15, show.legend = FALSE) +
+    scale_color_manual(values = custom_colors) +
+    geom_vline(xintercept = c(-0.5, 0.5), col = "red", linetype="dashed", alpha = 0.3) +
+    geom_hline(yintercept = -log10(0.05), col = "red", linetype="dashed", alpha = 0.3) +
+    ggtitle(title_text) +
+    labs(x = paste("Log2 Fold Change (", group1_name, "/", group2_name, ")"), 
+         y = "-Log10 Adjusted P-value",
+         color = "Significance") +
+    theme(legend.position = "bottom")
+  
+  return(p)
+}
+
+# ------------------------------------------------------------------------------
+# PART A: GLOBAL DIFFERENTIAL EXPRESSION
+# ------------------------------------------------------------------------------
+print("🌍 Running Global Analysis...")
+
+# Create a safe file name component
+safe_g1 <- gsub("[^A-Za-z0-9]", "_", DE_GROUP_1)
+safe_g2 <- gsub("[^A-Za-z0-9]", "_", DE_GROUP_2)
+
+tryCatch({
+  global_markers <- FindMarkers(seurat_subset, 
+                                ident.1 = DE_GROUP_1, 
+                                ident.2 = DE_GROUP_2, 
+                                group.by = DE_GROUP_COL,
+                                min.pct = 0.1, 
+                                logfc.threshold = 0.1)
+  
+  global_markers$Gene <- rownames(global_markers)
+  write.csv(global_markers, file = file.path(BASE_DIR, paste0("DE_", safe_g1, "_vs_", safe_g2, ".csv")))
+  
+  p_global <- plot_volcano(global_markers, paste(DE_GROUP_1, "vs", DE_GROUP_2), DE_GROUP_1, DE_GROUP_2)
+  print(p_global)
+  ggsave(filename = file.path(BASE_DIR, paste0("Volcano_", safe_g1, "_vs_", safe_g2, ".png")), plot = p_global, width = 7, height = 6)
+  print("✅ Global Analysis Complete.")
+  
+}, error = function(e) { print(paste("⚠️ Global DE Failed:", e$message)) })
+
+# ------------------------------------------------------------------------------
+# PART B: PER-CLUSTER DIFFERENTIAL EXPRESSION (Only if comparing conditions)
+# ------------------------------------------------------------------------------
+# If the user is comparing two Cell Types against each other, doing a per-cluster 
+# breakdown makes no sense (you can't compare Hepatocytes vs CRHR2 within Hepatocytes).
+# We only run this block if DE_GROUP_COL is something broad like "Species" or "Malaria".
+
+if (DE_GROUP_COL != "CellType_Final" && DE_GROUP_COL != "CellType_Global") {
+  
+  Idents(seurat_subset) <- "CellType_Final" 
+  clusters_to_test <- unique(Idents(seurat_subset))
+  
+  print("🔍 Running DE Analysis within each Cell Type...")
+  results_list <- list()
+  
+  for (cell_type in clusters_to_test) {
+    safe_name <- gsub("[^A-Za-z0-9]", "_", cell_type)
+    cluster_cells <- subset(seurat_subset, idents = cell_type)
+    
+    n_group1 <- sum(cluster_cells[[DE_GROUP_COL]] == DE_GROUP_1)
+    n_group2 <- sum(cluster_cells[[DE_GROUP_COL]] == DE_GROUP_2)
+    
+    if (n_group1 > 10 & n_group2 > 10) {
+      print(paste("   Testing:", cell_type, "|", DE_GROUP_1, ":", n_group1, "vs", DE_GROUP_2, ":", n_group2))
+      
+      tryCatch({
+        de_markers <- FindMarkers(cluster_cells, 
+                                  ident.1 = DE_GROUP_1, 
+                                  ident.2 = DE_GROUP_2, 
+                                  group.by = DE_GROUP_COL,
+                                  min.pct = 0.1,       
+                                  logfc.threshold = 0.1,
+                                  verbose = FALSE) 
+        
+        if (nrow(de_markers) > 0) {
+          de_markers$Cluster <- cell_type
+          de_markers$Gene <- rownames(de_markers)
+          results_list[[as.character(cell_type)]] <- de_markers
+          
+          p_cluster <- plot_volcano(de_markers, paste(cell_type, ":", DE_GROUP_1, "vs", DE_GROUP_2), DE_GROUP_1, DE_GROUP_2)
+          print(p_cluster) 
+          ggsave(filename = file.path(BASE_DIR, paste0("Volcano_", safe_name, "_", safe_g1, "_vs_", safe_g2, ".png")), plot = p_cluster, width = 7, height = 6)
+        }
+      }, error = function(e) {
+        print(paste("   ⚠️ Error in", cell_type, ":", e$message))
+      })
+      
+    } else {
+      print(paste("   ⚠️ Skipping", cell_type, "- Insufficient cells in one or both groups."))
+    }
+  }
+  
+  if (length(results_list) > 0) {
+    deg_table <- do.call(rbind, results_list)
+    write.csv(deg_table, file = file.path(BASE_DIR, paste0("DE_By_CellType_", safe_g1, "_vs_", safe_g2, ".csv")))
+    print("✅ Per-Cluster Analysis Complete.")
+  } else {
+    print("⚠️ No DE genes found in any cluster.")
+  }
+
+} else {
+  print("ℹ️ Skipping Per-Cluster Analysis because groups are Cell Types.")
+}
+```
+
+
+####STOP LST MEETING#####
+
+#DEG for Specific Genes
+```{r}
+#This block is for DEG of specific genes of interest. If you wanted to curate a list of TH1 related genes to see how they compare. Note that DEG may not be the best for this and instead you may want to generate an expression heatmap.
+
+# ==============================================================================
+# STEP 10: TARGETED GENE PANEL VOLCANO PLOT
+# ==============================================================================
+# Goal: Visualize the global shift in a specific, user-defined set of genes.
+
+library(ggplot2)
+library(ggrepel)
+
+print("🚀 Running Targeted DEG for Volcano Plot...")
+
+# ------------------------------------------------------------------------------
+# 1. DEFINE YOUR GENE PANEL
+# ------------------------------------------------------------------------------
+# Fill this list with your genes of interest. 
+# Example: target_panel <- c("ACTA2", "COL1A1", "TGFB1")
+target_panel <- c(
+  # Add genes here
+)
+
+if(length(target_panel) == 0) {
+  print("⚠️ Target panel is empty. Please add genes to the 'target_panel' list to run this block.")
+} else {
+  
+  # Keep only genes present in the dataset
+  target_panel <- intersect(target_panel, rownames(seurat_subset))
+  print(paste("Found", length(target_panel), "target genes in the dataset."))
+  
+  # 2. Run Targeted Differential Expression
+  target_deg <- FindMarkers(seurat_subset, 
+                            ident.1 = DE_GROUP_1, 
+                            ident.2 = DE_GROUP_2, 
+                            group.by = DE_GROUP_COL, 
+                            features = target_panel, 
+                            min.pct = 0,         # Force inclusion of rare genes
+                            logfc.threshold = 0, # Force inclusion of subtle changes
+                            verbose = FALSE)
+  
+  # 3. Prepare Data for Plotting
+  target_deg$Gene <- rownames(target_deg)
+  target_deg$Significance <- "NS"
+  target_deg$Significance[target_deg$p_val < 0.05 & target_deg$avg_log2FC > 0] <- paste("Up in", DE_GROUP_1)
+  target_deg$Significance[target_deg$p_val < 0.05 & target_deg$avg_log2FC < 0] <- paste("Up in", DE_GROUP_2)
+  
+  # Define custom colors
+  custom_colors <- c("blue", "red", "grey")
+  names(custom_colors) <- c(paste("Up in", DE_GROUP_2), paste("Up in", DE_GROUP_1), "NS")
+  
+  # 4. Generate the Volcano Plot
+  p_target_volcano <- ggplot(target_deg, aes(x = avg_log2FC, y = -log10(p_val), color = Significance, label = Gene)) +
+    geom_point(size = 3, alpha = 0.8) +
+    geom_text_repel(max.overlaps = 20, box.padding = 0.5, show.legend = FALSE) + 
+    scale_color_manual(values = custom_colors) +
+    geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.5) +
+    theme_bw() +
+    ggtitle(paste("Targeted Panel Shift:", DE_GROUP_1, "vs", DE_GROUP_2)) +
+    xlab(paste("Log2 Fold Change (Positive =", DE_GROUP_1, ")")) +
+    ylab("-Log10 P-Value") +
+    theme(legend.position = "bottom")
+  
+  # 5. Display and Save
+  print(p_target_volcano)
+  ggsave(file.path(BASE_DIR, paste0("Targeted_Volcano_", DE_GROUP_1, "_vs_", DE_GROUP_2, ".png")), plot = p_target_volcano, width = 8, height = 6)
+  
+  # Print the Table
+  print(paste("--- TARGETED SHIFTS:", DE_GROUP_1, "vs", DE_GROUP_2, "---"))
+  print(target_deg[order(target_deg$avg_log2FC), c("avg_log2FC", "p_val")])
+}
+```
+
+#Common and Differential Expression between clusters
+```{r}
+#Not working right now. Built to further check UMAP clustering in a detailed manner.
+
+# ==============================================================================
+# STEP 9.5: LINEAGE RELATIONSHIP ANALYSIS (CRHR2+ vs Hepatocytes)
+# ==============================================================================
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+print("🚀 Running Lineage Relationship Analysis...")
+
+# ------------------------------------------------------------------------------
+# 1. USER CONFIGURATION
+# ------------------------------------------------------------------------------
+# Define the two clusters you suspect are related
+GROUP_A <- "Hepatocytes"
+GROUP_B <- "Hepatocytes (High-RNA / Altered)"
+IDENT_COL <- "CellType_Final"
+
+Idents(seurat_subset) <- IDENT_COL
+
+# ------------------------------------------------------------------------------
+# 2. FIND SHARED LINEAGE MARKERS (Group A + Group B vs Everyone Else)
+# ------------------------------------------------------------------------------
+print("🔍 Identifying shared lineage markers...")
+# Temporarily group them together to see what makes them BOTH unique from the rest of the liver
+seurat_subset$Temp_Lineage <- as.character(Idents(seurat_subset))
+seurat_subset$Temp_Lineage[seurat_subset$Temp_Lineage %in% c(GROUP_A, GROUP_B)] <- "Target_Lineage"
+
+Idents(seurat_subset) <- "Temp_Lineage"
+shared_markers <- FindMarkers(seurat_subset, 
+                              ident.1 = "Target_Lineage", 
+                              only.pos = TRUE, 
+                              min.pct = 0.25, 
+                              logfc.threshold = 0.5,
+                              verbose = FALSE)
+
+top_shared <- head(rownames(shared_markers), 8) # Grab top 8 shared genes
+print(paste("Top Shared Markers:", paste(top_shared, collapse = ", ")))
+
+# ------------------------------------------------------------------------------
+# 3. FIND DIFFERENTIATING MARKERS (Group A vs Group B)
+# ------------------------------------------------------------------------------
+print("⚔️ Identifying differentiating state markers...")
+Idents(seurat_subset) <- IDENT_COL # Reset back to normal cell types
+
+direct_deg <- FindMarkers(seurat_subset, 
+                          ident.1 = GROUP_A, 
+                          ident.2 = GROUP_B, 
+                          verbose = FALSE)
+
+# Get top 5 unique to A and top 5 unique to B
+top_unique_A <- head(rownames(direct_deg[direct_deg$avg_log2FC > 0 & direct_deg$p_val_adj < 0.05, ]), 5)
+top_unique_B <- head(rownames(direct_deg[direct_deg$avg_log2FC < 0 & direct_deg$p_val_adj < 0.05, ]), 5)
+
+# ------------------------------------------------------------------------------
+# 4. AVERAGE EXPRESSION SCATTER PLOT
+# ------------------------------------------------------------------------------
+print("📊 Generating Co-Expression Scatter Plot...")
+
+# Calculate average expression per cluster
+avg_exp <- AverageExpression(seurat_subset, group.by = IDENT_COL, assays = "RNA")$RNA
+
+# Create a dataframe for plotting
+df_scatter <- data.frame(
+  Gene = rownames(avg_exp),
+  GroupA_Exp = log1p(avg_exp[, GROUP_A]), # log1p smooths the extreme spatial counts
+  GroupB_Exp = log1p(avg_exp[, GROUP_B])
+)
+
+# Label the genes we found in steps 2 and 3
+df_scatter$GeneType <- "Other"
+df_scatter$GeneType[df_scatter$Gene %in% top_shared] <- "Shared Lineage"
+df_scatter$GeneType[df_scatter$Gene %in% top_unique_A] <- paste("Unique to", GROUP_A)
+df_scatter$GeneType[df_scatter$Gene %in% top_unique_B] <- paste("Unique to", GROUP_B)
+
+# Set up specific colors
+scatter_colors <- c("grey80", "purple", "blue", "red")
+names(scatter_colors) <- c("Other", "Shared Lineage", paste("Unique to", GROUP_A), paste("Unique to", GROUP_B))
+
+p_scatter <- ggplot(df_scatter, aes(x = GroupA_Exp, y = GroupB_Exp, color = GeneType)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black", alpha = 0.5) +
+  geom_text_repel(data = subset(df_scatter, GeneType != "Other"), aes(label = Gene), 
+                  max.overlaps = 30, show.legend = FALSE, size = 4, fontface = "bold") +
+  scale_color_manual(values = scatter_colors) +
+  theme_bw() +
+  ggtitle(paste("Lineage Comparison:", GROUP_A, "vs", GROUP_B)) +
+  xlab(paste("Log1p Average Expression -", GROUP_A)) +
+  ylab(paste("Log1p Average Expression -", GROUP_B)) +
+  theme(legend.position = "bottom", legend.title = element_blank())
+
+print(p_scatter)
+ggsave(filename = file.path(BASE_DIR, "Lineage_Scatter_Plot.png"), plot = p_scatter, width = 7, height = 7)
+
+# ------------------------------------------------------------------------------
+# 5. COMPARATIVE DOT PLOT
+# ------------------------------------------------------------------------------
+
+print("🟢 Generating Comparative DotPlot...")
+
+# Combine the genes into one list for the DotPlot
+features_to_plot <- c(top_shared, top_unique_A, top_unique_B)
+
+p_dot <- DotPlot(seurat_subset, features = features_to_plot, group.by = IDENT_COL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Marker Validation Across All Clusters") +
+  xlab("Genes (Shared -> Unique A -> Unique B)") +
+  ylab("Cell Type")
+
+print(p_dot)
+ggsave(filename = file.path(BASE_DIR, "Lineage_DotPlot.png"), plot = p_dot, width = 10, height = 5)
+
+print("✅ Lineage Analysis Complete.")
+```
+
