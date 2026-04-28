@@ -1,4 +1,4 @@
-To make sure you can move along with me during the meeting please do the following before attending (instructions attached):
+To make sure you can move along with me during you analyze data please do the following before attending (instructions attached):
 1)	Create a folder in BOX named “LST” (case sensitive)
 a.	Copy the data from the Box Folder I shared, to the new LST folder
 2)	Install R
